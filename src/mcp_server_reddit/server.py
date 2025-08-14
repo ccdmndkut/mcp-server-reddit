@@ -1,7 +1,7 @@
 from enum import Enum
 import json
 from typing import Sequence
-import redditwarp.SYNC
+import praw
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
@@ -12,7 +12,8 @@ from pydantic import BaseModel
 class PostType(str, Enum):
     LINK = "link"
     TEXT = "text"
-    GALLERY = "gallery"
+    IMAGE = "image"
+    VIDEO = "video"
     UNKNOWN = "unknown"
 
 
@@ -69,43 +70,45 @@ class PostDetail(BaseModel):
 
 class RedditServer:
     def __init__(self):
-        self.client = redditwarp.SYNC.Client()
+        self.reddit = praw.Reddit(
+            client_id="GuixM5R4H8A7Xiyo01FueA",
+            client_secret="kzE9ChaZy3bgIEvDdBRwxPEezqVB-A",
+            user_agent="mcp-server-reddit v1.0"
+        )
 
     def _get_post_type(self, submission) -> PostType:
         """Helper method to determine post type"""
-        if isinstance(submission, redditwarp.models.submission_SYNC.LinkPost):
-            return PostType.LINK
-        elif isinstance(submission, redditwarp.models.submission_SYNC.TextPost):
+        if hasattr(submission, 'post_hint'):
+            if submission.post_hint == 'image':
+                return PostType.IMAGE
+            elif submission.post_hint == 'hosted:video' or submission.post_hint == 'rich:video':
+                return PostType.VIDEO
+            elif submission.post_hint == 'link':
+                return PostType.LINK
+        
+        if submission.is_self:
             return PostType.TEXT
-        elif isinstance(submission, redditwarp.models.submission_SYNC.GalleryPost):
-            return PostType.GALLERY
+        
         return PostType.UNKNOWN
 
-    # The type can actually be determined by submission.post_hint
-    # - self for text
-    # - image for image
-    # - hosted:video for video
     def _get_post_content(self, submission) -> str | None:
         """Helper method to extract post content based on type"""
-        if isinstance(submission, redditwarp.models.submission_SYNC.LinkPost):
-            return submission.permalink
-        elif isinstance(submission, redditwarp.models.submission_SYNC.TextPost):
-            return submission.body
-        elif isinstance(submission, redditwarp.models.submission_SYNC.GalleryPost):
-            return str(submission.gallery_link)
-        return None
+        if submission.is_self:
+            return submission.selftext
+        else:
+            return submission.url
 
     def _build_post(self, submission) -> Post:
         """Helper method to build Post object from submission"""
         return Post(
-            id=submission.id36,
+            id=submission.id,
             title=submission.title,
-            author=submission.author_display_name or '[deleted]',
+            author=str(submission.author) if submission.author else '[deleted]',
             score=submission.score,
-            subreddit=submission.subreddit.name,
-            url=submission.permalink,
-            created_at=submission.created_at.astimezone().isoformat(),
-            comment_count=submission.comment_count,
+            subreddit=submission.subreddit.display_name,
+            url=f"https://reddit.com{submission.permalink}",
+            created_at=str(submission.created_utc),
+            comment_count=submission.num_comments,
             post_type=self._get_post_type(submission),
             content=self._get_post_content(submission)
         )
@@ -113,34 +116,35 @@ class RedditServer:
     def get_frontpage_posts(self, limit: int = 10) -> list[Post]:
         """Get hot posts from Reddit frontpage"""
         posts = []
-        for subm in self.client.p.front.pull.hot(limit):
-            posts.append(self._build_post(subm))
+        for submission in self.reddit.front.hot(limit=limit):
+            posts.append(self._build_post(submission))
         return posts
 
     def get_subreddit_info(self, subreddit_name: str) -> SubredditInfo:
         """Get information about a subreddit"""
-        subr = self.client.p.subreddit.fetch_by_name(subreddit_name)
+        subreddit = self.reddit.subreddit(subreddit_name)
         return SubredditInfo(
-            name=subr.name,
-            subscriber_count=subr.subscriber_count,
-            description=subr.public_description
+            name=subreddit.display_name,
+            subscriber_count=subreddit.subscribers,
+            description=subreddit.public_description
         )
 
-    def _build_comment_tree(self, node, depth: int = 3) -> Comment | None:
+    def _build_comment_tree(self, comment, depth: int = 3) -> Comment | None:
         """Helper method to recursively build comment tree"""
-        if depth <= 0 or not node:
+        if depth <= 0 or not comment or isinstance(comment, praw.models.MoreComments):
             return None
 
-        comment = node.value
         replies = []
-        for child in node.children:
-            child_comment = self._build_comment_tree(child, depth - 1)
-            if child_comment:
-                replies.append(child_comment)
+        if hasattr(comment, 'replies') and depth > 1:
+            for reply in comment.replies[:5]:  # Limit to 5 replies per level
+                if not isinstance(reply, praw.models.MoreComments):
+                    reply_comment = self._build_comment_tree(reply, depth - 1)
+                    if reply_comment:
+                        replies.append(reply_comment)
 
         return Comment(
-            id=comment.id36,
-            author=comment.author_display_name or '[deleted]',
+            id=comment.id,
+            author=str(comment.author) if comment.author else '[deleted]',
             body=comment.body,
             score=comment.score,
             replies=replies
@@ -149,34 +153,39 @@ class RedditServer:
     def get_subreddit_hot_posts(self, subreddit_name: str, limit: int = 10) -> list[Post]:
         """Get hot posts from a specific subreddit"""
         posts = []
-        for subm in self.client.p.subreddit.pull.hot(subreddit_name, limit):
-            posts.append(self._build_post(subm))
+        subreddit = self.reddit.subreddit(subreddit_name)
+        for submission in subreddit.hot(limit=limit):
+            posts.append(self._build_post(submission))
         return posts
 
     def get_subreddit_new_posts(self, subreddit_name: str, limit: int = 10) -> list[Post]:
         """Get new posts from a specific subreddit"""
         posts = []
-        for subm in self.client.p.subreddit.pull.new(subreddit_name, limit):
-            posts.append(self._build_post(subm))
+        subreddit = self.reddit.subreddit(subreddit_name)
+        for submission in subreddit.new(limit=limit):
+            posts.append(self._build_post(submission))
         return posts
 
-    def get_subreddit_top_posts(self, subreddit_name: str, limit: int = 10, time: str = '') -> list[Post]:
+    def get_subreddit_top_posts(self, subreddit_name: str, limit: int = 10, time: str = 'all') -> list[Post]:
         """Get top posts from a specific subreddit"""
         posts = []
-        for subm in self.client.p.subreddit.pull.top(subreddit_name, limit, time=time):
-            posts.append(self._build_post(subm))
+        subreddit = self.reddit.subreddit(subreddit_name)
+        time_filter = time if time else 'all'
+        for submission in subreddit.top(time_filter=time_filter, limit=limit):
+            posts.append(self._build_post(submission))
         return posts
 
     def get_subreddit_rising_posts(self, subreddit_name: str, limit: int = 10) -> list[Post]:
         """Get rising posts from a specific subreddit"""
         posts = []
-        for subm in self.client.p.subreddit.pull.rising(subreddit_name, limit):
-            posts.append(self._build_post(subm))
+        subreddit = self.reddit.subreddit(subreddit_name)
+        for submission in subreddit.rising(limit=limit):
+            posts.append(self._build_post(submission))
         return posts
 
     def get_post_content(self, post_id: str, comment_limit: int = 10, comment_depth: int = 3) -> PostDetail:
         """Get detailed content of a specific post including comments"""
-        submission = self.client.p.submission.fetch(post_id)
+        submission = self.reddit.submission(id=post_id)
         post = self._build_post(submission)
 
         # Fetch comments
@@ -187,55 +196,70 @@ class RedditServer:
     def get_post_comments(self, post_id: str, limit: int = 10) -> list[Comment]:
         """Get comments from a post"""
         comments = []
-        tree_node = self.client.p.comment_tree.fetch(post_id, sort='top', limit=limit)
-        for node in tree_node.children:
-            comment = self._build_comment_tree(node)
-            if comment:
-                comments.append(comment)
+        submission = self.reddit.submission(id=post_id)
+        submission.comments.replace_more(limit=0)  # Remove "more comments" objects
+        
+        for comment in submission.comments[:limit]:
+            if not isinstance(comment, praw.models.MoreComments):
+                built_comment = self._build_comment_tree(comment)
+                if built_comment:
+                    comments.append(built_comment)
         return comments
 
     def search_reddit(self, query: str, sort: str = "relevance", time: str = "all", limit: int = 10) -> list[Post]:
         """Search across all of Reddit for posts matching a query"""
         posts = []
-        # Search across all subreddits using 'all'
-        for subm in self.client.p.subreddit.pull.search("all", query, sort=sort, time=time, amount=limit):
-            posts.append(self._build_post(subm))
+        try:
+            for submission in self.reddit.subreddit("all").search(query, sort=sort, time_filter=time, limit=limit):
+                posts.append(self._build_post(submission))
+        except Exception as e:
+            raise ValueError(f"Search failed: {str(e)}")
         return posts
 
     def search_subreddit(self, subreddit_name: str, query: str, sort: str = "relevance", time: str = "all", limit: int = 10) -> list[Post]:
         """Search within a specific subreddit for posts matching a query"""
         posts = []
-        for subm in self.client.p.subreddit.pull.search(subreddit_name, query, sort=sort, time=time, amount=limit):
-            posts.append(self._build_post(subm))
+        try:
+            subreddit = self.reddit.subreddit(subreddit_name)
+            for submission in subreddit.search(query, sort=sort, time_filter=time, limit=limit):
+                posts.append(self._build_post(submission))
+        except Exception as e:
+            raise ValueError(f"Subreddit search failed: {str(e)}")
         return posts
 
     def search_subreddits(self, query: str, limit: int = 10) -> list[SubredditInfo]:
         """Search for subreddits by name or description"""
         subreddits = []
-        # Use search_by_name for finding subreddits
-        for subr in self.client.p.subreddit.search_by_name(query, limit=limit):
-            subreddits.append(SubredditInfo(
-                name=subr.name,
-                subscriber_count=subr.subscriber_count,
-                description=subr.public_description
-            ))
+        try:
+            for subreddit in self.reddit.subreddits.search(query, limit=limit):
+                subreddits.append(SubredditInfo(
+                    name=subreddit.display_name,
+                    subscriber_count=subreddit.subscribers,
+                    description=subreddit.public_description
+                ))
+        except Exception as e:
+            raise ValueError(f"Subreddit search failed: {str(e)}")
         return subreddits
 
     def search_user_posts(self, username: str, sort: str = "new", time: str = "all", limit: int = 10) -> list[Post]:
         """Search through a user's post history"""
         posts = []
-        
-        if sort == "new":
-            submissions = self.client.p.user.pull.submissions.new(username, amount=limit)
-        elif sort == "hot":
-            submissions = self.client.p.user.pull.submissions.hot(username, amount=limit)
-        elif sort == "top":
-            submissions = self.client.p.user.pull.submissions.top(username, time=time, amount=limit)
-        else:
-            submissions = self.client.p.user.pull.submissions.new(username, amount=limit)
-        
-        for subm in submissions:
-            posts.append(self._build_post(subm))
+        try:
+            user = self.reddit.redditor(username)
+            
+            if sort == "new":
+                submissions = user.submissions.new(limit=limit)
+            elif sort == "hot":
+                submissions = user.submissions.hot(limit=limit)
+            elif sort == "top":
+                submissions = user.submissions.top(time_filter=time, limit=limit)
+            else:
+                submissions = user.submissions.new(limit=limit)
+            
+            for submission in submissions:
+                posts.append(self._build_post(submission))
+        except Exception as e:
+            raise ValueError(f"User search failed: {str(e)}")
         
         return posts
 
@@ -340,8 +364,8 @@ async def serve() -> None:
                         "time": {
                             "type": "string",
                             "description": "Time filter for top posts (e.g. 'hour', 'day', 'week', 'month', 'year', 'all')",
-                            "default": "",
-                            "enum": ["", "hour", "day", "week", "month", "year", "all"]
+                            "default": "all",
+                            "enum": ["hour", "day", "week", "month", "year", "all"]
                         }
                     },
                     "required": ["subreddit_name"]
@@ -579,7 +603,7 @@ async def serve() -> None:
                     if not subreddit_name:
                         raise ValueError("Missing required argument: subreddit_name")
                     limit = arguments.get("limit", 10)
-                    time = arguments.get("time", "")
+                    time = arguments.get("time", "all")
                     result = reddit_server.get_subreddit_top_posts(subreddit_name, limit, time)
 
                 case RedditTools.GET_SUBREDDIT_RISING_POSTS.value:
